@@ -1,0 +1,47 @@
+{
+  "model_type": "ExtraTreesClassifier",
+  "model_file": "model_xgboost.pkl",
+  "feature_names": [
+    "B02",
+    "B03",
+    "B04",
+    "B08",
+    "B11",
+    "NDVI",
+    "NDWI",
+    "MNDWI",
+    "NDBI"
+  ],
+  "class_names": {
+    "1": "Sawah",
+    "2": "Bangunan",
+    "3": "Mangrove",
+    "4": "Lahan Hijau",
+    "5": "Laut",
+    "6": "Danau/Ranu"
+  },
+  "class_to_id": {
+    "Sawah": 1,
+    "Bangunan": 2,
+    "Mangrove": 3,
+    "Lahan Hijau": 4,
+    "Laut": 5,
+    "Danau/Ranu": 6
+  },
+  "id_to_class": {
+    "1": "Sawah",
+    "2": "Bangunan",
+    "3": "Mangrove",
+    "4": "Lahan Hijau",
+    "5": "Laut",
+    "6": "Danau/Ranu"
+  },
+  "reflectance_scaling": null,
+  "reflectance_scaling_note": "Belum ditetapkan otomatis. Isi berdasarkan preprocessing yang benar-benar digunakan saat pelatihan.",
+  "index_formulas": {
+    "NDVI": "(B08 - B04) / (B08 + B04)",
+    "NDWI": "(B03 - B08) / (B03 + B08)",
+    "MNDWI": "(B03 - B11) / (B03 + B11)",
+    "NDBI": "(B11 - B08) / (B11 + B08)"
+  }
+}
