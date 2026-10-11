@@ -1,40 +1,31 @@
 
-from pathlib import Path
-import json
-import pickle
-
-import joblib
-import numpy as np
-import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
-import streamlit.components.v1 as components
+import pandas as pd
+import numpy as np
+import joblib
+from pathlib import Path
+from huggingface_hub import hf_hub_download
 
-
-# =========================================================
+# =====================================================
 # KONFIGURASI
-# =========================================================
-
+# =====================================================
 st.set_page_config(
-    page_title="Dashboard Klasifikasi Tutupan Lahan Jawa Timur",
-    page_icon="🌍",
+    page_title="Klasifikasi Tutupan Lahan Jawa Timur",
+    page_icon="🌏",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_DIR = BASE_DIR / "models"
 DATA_DIR = BASE_DIR / "data"
 STATIC_DIR = BASE_DIR / "static"
 
-MODEL_JOBLIB = MODEL_DIR / "model_klasifikasi.joblib"
-MODEL_PICKLE = MODEL_DIR / "model_xgboost.pkl"
-METADATA_PATH = MODEL_DIR / "metadata_model.json"
+HF_REPO_ID = "Dafi86/model-klasifikasi-jatim"
+HF_MODEL_FILENAME = "model_klasifikasi.joblib"
 
-EVALUATION_PATH = DATA_DIR / "evaluasi_model.csv"
-REPORT_PATH = DATA_DIR / "classification_report.csv"
-CONFUSION_PATH = DATA_DIR / "confusion_matrix.csv"
-MAP_PATH = STATIC_DIR / "peta_klasifikasi.html"
+FEATURES = [
+    "B02", "B03", "B04", "B08", "B11",
+    "NDVI", "NDWI", "MNDWI", "NDBI"
+]
 
 CLASS_NAMES = {
     1: "Sawah",
@@ -45,570 +36,315 @@ CLASS_NAMES = {
     6: "Danau/Ranu",
 }
 
-FEATURES = [
-    "B02", "B03", "B04", "B08", "B11",
-    "NDVI", "NDWI", "MNDWI", "NDBI",
-]
-
-
-# =========================================================
-# TAMPILAN
-# =========================================================
-
-st.markdown(
-    """
-    <style>
-    .main .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 2rem;
-    }
-    .hero {
-        padding: 1.5rem;
-        border-radius: 14px;
-        background: linear-gradient(120deg, #123b35, #26745c);
-        color: white;
-        margin-bottom: 1.2rem;
-    }
-    .hero h1 {
-        color: white;
-        margin-bottom: .4rem;
-    }
-    .hero p {
-        color: #e6f5ee;
-        margin-bottom: 0;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    """
-    <div class="hero">
-      <h1>🌍 Dashboard Tutupan Lahan Jawa Timur</h1>
-      <p>
-        Visualisasi peta, evaluasi model machine learning,
-        dan prediksi kelas tutupan lahan.
-      </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# =========================================================
-# FUNGSI PEMBACAAN DATA
-# =========================================================
-
-def read_csv_safe(path):
-    """Membaca CSV jika tersedia tanpa menghentikan aplikasi."""
-    if not path.exists():
-        return None
-
-    try:
-        return pd.read_csv(path)
-    except Exception as exc:
-        st.warning(f"Gagal membaca {path.name}: {exc}")
-        return None
-
-
-def read_json_safe(path):
-    """Membaca metadata JSON jika tersedia."""
-    if not path.exists():
-        return None
-
-    try:
-        with open(path, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except Exception as exc:
-        st.warning(f"Gagal membaca {path.name}: {exc}")
-        return None
-
-
+# =====================================================
+# MEMUAT MODEL DARI HUGGING FACE
+# =====================================================
 @st.cache_resource
-def load_model(model_path, modified_time):
-    """
-    Memuat model hanya ketika fungsi dipanggil.
-    modified_time membantu cache diperbarui jika file berubah.
-    """
-    path = Path(model_path)
+def load_model():
+    token = st.secrets.get("HF_TOKEN")
 
-    if not path.exists():
-        raise FileNotFoundError(f"File model tidak ditemukan: {path}")
+    if not token:
+        raise RuntimeError(
+            "HF_TOKEN belum diatur. Buka Settings > Secrets "
+            "di Streamlit Cloud."
+        )
 
-    suffix = path.suffix.lower()
+    model_path = hf_hub_download(
+        repo_id=HF_REPO_ID,
+        filename=HF_MODEL_FILENAME,
+        token=token,
+    )
 
-    if suffix == ".joblib":
-        return joblib.load(path)
-
-    if suffix in (".pkl", ".pickle"):
-        # Hanya untuk file pickle yang berasal dari sumber tepercaya.
-        with open(path, "rb") as file:
-            return pickle.load(file)
-
-    raise ValueError(f"Format model tidak didukung: {suffix}")
+    return joblib.load(model_path)
 
 
-def show_status(label, path):
+def calculate_indices(b02, b03, b04, b08, b11):
+    def safe_ratio(a, b):
+        return (a / b) if b != 0 else 0.0
+
+    ndvi = safe_ratio(b08 - b04, b08 + b04)
+    ndwi = safe_ratio(b03 - b08, b03 + b08)
+    mndwi = safe_ratio(b03 - b11, b03 + b11)
+    ndbi = safe_ratio(b11 - b08, b11 + b08)
+
+    return ndvi, ndwi, mndwi, ndbi
+
+
+def read_csv_file(filename):
+    path = DATA_DIR / filename
     if path.exists():
-        st.success(f"{label}: tersedia")
-    else:
-        st.warning(f"{label}: tidak ditemukan")
+        try:
+            return pd.read_csv(path)
+        except Exception as error:
+            st.error(f"Gagal membaca {filename}: {error}")
+    return None
 
 
-def normalize_class_report(df):
-    """
-    Mengubah laporan klasifikasi ke format tabel yang mudah dibaca
-    jika CSV memiliki kolom nama kelas sebagai indeks.
-    """
-    if df is None:
-        return None
-
-    result = df.copy()
-
-    if result.columns[0].lower().startswith("unnamed"):
-        result = result.rename(columns={result.columns[0]: "Kelas"})
-
-    return result
-
-
-# =========================================================
-# SIDEBAR / NAVIGASI
-# =========================================================
-
-st.sidebar.title("Navigasi")
-
-page = st.sidebar.radio(
-    "Pilih halaman",
-    [
-        "Dashboard",
-        "Peta Klasifikasi",
-        "Evaluasi Model",
-        "Prediksi",
-        "Informasi",
-    ],
+# =====================================================
+# HEADER DAN NAVIGASI
+# =====================================================
+st.title("🌏 Dashboard Klasifikasi Tutupan Lahan Jawa Timur")
+st.caption(
+    "Klasifikasi tutupan lahan menggunakan fitur Sentinel-2 "
+    "dan model machine learning."
 )
 
-st.sidebar.divider()
-st.sidebar.caption("Klasifikasi tutupan lahan berbasis citra Sentinel-2")
+with st.sidebar:
+    st.header("Navigasi")
+    page = st.radio(
+        "Pilih halaman",
+        [
+            "Dashboard",
+            "Peta Klasifikasi",
+            "Evaluasi Model",
+            "Prediksi Tutupan Lahan",
+            "Informasi",
+        ],
+    )
+
+    st.divider()
+    st.caption("Model: Hugging Face")
+    st.caption(HF_REPO_ID)
 
 
-# =========================================================
+# =====================================================
 # HALAMAN DASHBOARD
-# =========================================================
-
+# =====================================================
 if page == "Dashboard":
     st.subheader("Ringkasan Proyek")
 
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Jumlah kelas", len(CLASS_NAMES))
+    col2.metric("Jumlah fitur", len(FEATURES))
+    col3.metric("Sumber data", "Sentinel-2")
+
+    st.markdown("### Kelas Tutupan Lahan")
+
+    cols = st.columns(3)
+    for i, (class_id, class_name) in enumerate(CLASS_NAMES.items()):
+        cols[i % 3].info(f"{class_id}. {class_name}")
+
+    st.markdown("### Tentang Dashboard")
     st.write(
-        """
-        Dashboard ini digunakan untuk melihat hasil klasifikasi
-        tutupan lahan, mengevaluasi performa model, dan mencoba
-        prediksi berdasarkan nilai band Sentinel-2 beserta indeks
-        spektralnya.
-        """
+        "Dashboard ini digunakan untuk melihat peta klasifikasi, "
+        "hasil evaluasi model, serta mencoba prediksi tutupan lahan "
+        "berdasarkan lima band Sentinel-2 dan indeks spektral."
     )
 
-    st.subheader("Status berkas proyek")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        show_status("Model Joblib", MODEL_JOBLIB)
-        show_status("Model Pickle lama", MODEL_PICKLE)
-        show_status("Metadata model", METADATA_PATH)
-
-    with col2:
-        show_status("Data evaluasi", EVALUATION_PATH)
-        show_status("Laporan klasifikasi", REPORT_PATH)
-        show_status("Confusion matrix", CONFUSION_PATH)
-        show_status("Peta HTML", MAP_PATH)
-
-    evaluation = read_csv_safe(EVALUATION_PATH)
-
-    if evaluation is not None:
-        st.subheader("Data evaluasi")
-
-        st.metric("Jumlah baris evaluasi", f"{len(evaluation):,}")
-
-        if {"y_true", "y_pred"}.issubset(evaluation.columns):
-            accuracy = (
-                evaluation["y_true"] == evaluation["y_pred"]
-            ).mean()
-
-            st.metric("Akurasi dari data evaluasi", f"{accuracy:.2%}")
-
-    st.info(
-        "Model tidak dimuat pada halaman Dashboard. "
-        "Buka halaman Prediksi untuk mencoba memuat model."
+    st.warning(
+        "Cakupan peta bergantung pada data raster yang tersedia. "
+        "Jangan menganggap seluruh Jawa Timur tercakup jika data "
+        "hanya meliputi sebagian wilayah."
     )
 
 
-# =========================================================
-# HALAMAN PETA
-# =========================================================
-
+# =====================================================
+# HALAMAN PETA KLASIFIKASI
+# =====================================================
 elif page == "Peta Klasifikasi":
     st.subheader("Peta Klasifikasi Tutupan Lahan")
 
-    if MAP_PATH.exists():
+    map_path = STATIC_DIR / "peta_klasifikasi.html"
+
+    if map_path.exists():
         try:
-            html = MAP_PATH.read_text(encoding="utf-8")
-            components.html(
-                html,
-                height=700,
+            html_content = map_path.read_text(encoding="utf-8")
+            st.components.v1.html(
+                html_content,
+                height=650,
                 scrolling=True,
             )
-        except Exception as exc:
-            st.error(f"Peta gagal ditampilkan: {exc}")
+        except Exception as error:
+            st.error(f"Peta gagal ditampilkan: {error}")
     else:
         st.warning(
-            "File peta tidak ditemukan di "
-            f"`{MAP_PATH}`."
+            "File peta tidak ditemukan. Pastikan file berikut "
+            "sudah diunggah ke GitHub:"
         )
-        st.write(
-            "Letakkan file peta HTML di folder `static` dengan nama "
-            "`peta_klasifikasi.html`."
-        )
-
-    st.caption(
-        "Pastikan peta dan raster yang digunakan memiliki cakupan "
-        "wilayah yang sesuai. Area tanpa data tidak boleh dianggap "
-        "sebagai hasil klasifikasi."
-    )
+        st.code("static/peta_klasifikasi.html")
 
 
-# =========================================================
-# HALAMAN EVALUASI
-# =========================================================
-
+# =====================================================
+# HALAMAN EVALUASI MODEL
+# =====================================================
 elif page == "Evaluasi Model":
     st.subheader("Evaluasi Model")
 
-    evaluation = read_csv_safe(EVALUATION_PATH)
-    report = normalize_class_report(read_csv_safe(REPORT_PATH))
-    confusion = read_csv_safe(CONFUSION_PATH)
+    evaluation = read_csv_file("evaluasi_model.csv")
+    report = read_csv_file("classification_report.csv")
+    matrix = read_csv_file("confusion_matrix.csv")
 
+    st.markdown("### Ringkasan Evaluasi")
     if evaluation is not None:
-        st.markdown("### Ringkasan evaluasi")
-
-        if {"y_true", "y_pred"}.issubset(evaluation.columns):
-            y_true = evaluation["y_true"]
-            y_pred = evaluation["y_pred"]
-            accuracy = (y_true == y_pred).mean()
-
-            c1, c2 = st.columns(2)
-            c1.metric("Akurasi", f"{accuracy:.2%}")
-            c2.metric("Jumlah sampel", f"{len(evaluation):,}")
-
-            st.markdown("### Distribusi hasil prediksi")
-
-            distribution = (
-                evaluation["y_pred"]
-                .map(CLASS_NAMES)
-                .fillna(evaluation["y_pred"].astype(str))
-                .value_counts()
-            )
-
-            st.bar_chart(distribution)
-
-        else:
-            st.warning(
-                "CSV evaluasi harus memiliki kolom `y_true` dan `y_pred` "
-                "untuk menghitung akurasi."
-            )
-
-        with st.expander("Lihat data evaluasi"):
-            st.dataframe(evaluation, use_container_width=True)
-
+        st.dataframe(evaluation, use_container_width=True)
     else:
-        st.warning("Data evaluasi tidak ditemukan.")
+        st.info("File data/evaluasi_model.csv belum tersedia.")
 
-    st.divider()
-    st.markdown("### Laporan klasifikasi")
-
+    st.markdown("### Classification Report")
     if report is not None:
         st.dataframe(report, use_container_width=True)
     else:
-        st.warning("Laporan klasifikasi tidak ditemukan.")
+        st.info("File data/classification_report.csv belum tersedia.")
 
-    st.divider()
-    st.markdown("### Confusion matrix")
-
-    if confusion is not None:
-        st.dataframe(confusion, use_container_width=True)
-
-        try:
-            numeric = confusion.select_dtypes(include="number")
-
-            if not numeric.empty:
-                fig, ax = plt.subplots(figsize=(8, 6))
-                image = ax.imshow(numeric.to_numpy(), cmap="Greens")
-
-                ax.set_title("Confusion Matrix")
-                ax.set_xlabel("Prediksi")
-                ax.set_ylabel("Aktual")
-
-                ax.set_xticks(range(numeric.shape[1]))
-                ax.set_xticklabels(numeric.columns, rotation=45, ha="right")
-
-                row_labels = (
-                    confusion.iloc[:, 0].astype(str).tolist()
-                    if confusion.shape[1] > numeric.shape[1]
-                    else [str(i) for i in range(numeric.shape[0])]
-                )
-
-                ax.set_yticks(range(numeric.shape[0]))
-                ax.set_yticklabels(row_labels)
-
-                for i in range(numeric.shape[0]):
-                    for j in range(numeric.shape[1]):
-                        ax.text(
-                            j, i, f"{numeric.iloc[i, j]:g}",
-                            ha="center", va="center",
-                        )
-
-                fig.colorbar(image, ax=ax)
-                fig.tight_layout()
-                st.pyplot(fig)
-                plt.close(fig)
-
-        except Exception as exc:
-            st.warning(f"Grafik confusion matrix gagal dibuat: {exc}")
-
+    st.markdown("### Confusion Matrix")
+    if matrix is not None:
+        st.dataframe(matrix, use_container_width=True)
     else:
-        st.warning("File confusion matrix tidak ditemukan.")
+        st.info("File data/confusion_matrix.csv belum tersedia.")
 
 
-# =========================================================
+# =====================================================
 # HALAMAN PREDIKSI
-# =========================================================
-
-elif page == "Prediksi":
+# =====================================================
+elif page == "Prediksi Tutupan Lahan":
     st.subheader("Prediksi Tutupan Lahan")
 
-    st.warning(
-        "Masukkan nilai band dan indeks dengan skala serta "
-        "preprocessing yang sama seperti saat model dilatih. "
-        "Nilai contoh di bawah bukan data Sentinel-2 aktual."
+    st.write(
+        "Masukkan nilai band Sentinel-2. Pastikan skala band dan "
+        "preprocessing sesuai dengan proses pelatihan model."
     )
 
-    model_path = (
-        MODEL_JOBLIB if MODEL_JOBLIB.exists()
-        else MODEL_PICKLE
-    )
-
-    if not model_path.exists():
-        st.error(
-            "File model tidak ditemukan. Letakkan model yang sudah "
-            "disimpan ulang di `models/model_klasifikasi.joblib`."
-        )
-        st.stop()
-
-    metadata = read_json_safe(METADATA_PATH)
-
-    if metadata is not None:
-        with st.expander("Metadata model"):
-            st.json(metadata)
-
-    st.markdown("### Masukkan nilai fitur")
-
-    defaults = {
-        "B02": 1000.0,
-        "B03": 1200.0,
-        "B04": 1000.0,
-        "B08": 2500.0,
-        "B11": 1500.0,
-    }
-
-    with st.form("prediction_form"):
-        band_values = {}
+    with st.form("form_prediksi"):
+        st.markdown("#### Nilai Band Sentinel-2")
 
         col1, col2, col3 = st.columns(3)
 
-        columns = [col1, col2, col3]
-
-        for i, feature in enumerate(["B02", "B03", "B04", "B08", "B11"]):
-            with columns[i % 3]:
-                band_values[feature] = st.number_input(
-                    feature,
-                    value=defaults[feature],
-                    step=100.0,
-                    format="%.4f",
-                    help="Masukkan nilai dengan skala yang sama seperti data training.",
-                )
-
-        # Indeks dihitung otomatis berdasarkan nilai band yang dimasukkan.
-        # Pastikan rumus ini identik dengan preprocessing saat training.
-        b03 = band_values["B03"]
-        b04 = band_values["B04"]
-        b08 = band_values["B08"]
-        b11 = band_values["B11"]
-
-        def safe_index(numerator, denominator):
-            if abs(denominator) < 1e-12:
-                return 0.0
-            return numerator / denominator
-
-        indices = {
-            "NDVI": safe_index(b08 - b04, b08 + b04),
-            "NDWI": safe_index(b03 - b08, b03 + b08),
-            "MNDWI": safe_index(b03 - b11, b03 + b11),
-            "NDBI": safe_index(b11 - b08, b11 + b08),
-        }
-
-        st.markdown("### Indeks spektral hasil perhitungan")
-
-        index_cols = st.columns(4)
-
-        for i, (name, value) in enumerate(indices.items()):
-            index_cols[i].metric(name, f"{value:.4f}")
-
-        submitted = st.form_submit_button(
-            "Jalankan Prediksi",
-            type="primary",
-            use_container_width=True,
+        b02 = col1.number_input(
+            "B02 (Blue)", min_value=0.0, value=0.1, format="%.6f"
+        )
+        b03 = col2.number_input(
+            "B03 (Green)", min_value=0.0, value=0.1, format="%.6f"
+        )
+        b04 = col3.number_input(
+            "B04 (Red)", min_value=0.0, value=0.1, format="%.6f"
+        )
+        b08 = col1.number_input(
+            "B08 (NIR)", min_value=0.0, value=0.2, format="%.6f"
+        )
+        b11 = col2.number_input(
+            "B11 (SWIR)", min_value=0.0, value=0.1, format="%.6f"
         )
 
-    if submitted:
+        ndvi, ndwi, mndwi, ndbi = calculate_indices(
+            b02, b03, b04, b08, b11
+        )
+
+        st.markdown("#### Indeks Spektral")
+        i1, i2, i3, i4 = st.columns(4)
+        i1.metric("NDVI", f"{ndvi:.4f}")
+        i2.metric("NDWI", f"{ndwi:.4f}")
+        i3.metric("MNDWI", f"{mndwi:.4f}")
+        i4.metric("NDBI", f"{ndbi:.4f}")
+
+        submit_prediction = st.form_submit_button(
+            "Prediksi",
+            type="primary",
+        )
+
+    if submit_prediction:
+        input_data = pd.DataFrame(
+            [[b02, b03, b04, b08, b11,
+              ndvi, ndwi, mndwi, ndbi]],
+            columns=FEATURES,
+        )
+
         try:
-            model = load_model(
-                str(model_path),
-                model_path.stat().st_mtime,
-            )
+            with st.spinner("Memuat model dan menjalankan prediksi..."):
+                model = load_model()
+                prediction = model.predict(input_data)
 
-            row = {
-                **band_values,
-                **indices,
-            }
-
-            input_df = pd.DataFrame(
-                [[row[feature] for feature in FEATURES]],
-                columns=FEATURES,
-            )
-
-            # Periksa jumlah fitur jika model menyediakan informasi ini.
-            expected_features = getattr(model, "n_features_in_", None)
-
-            if (
-                expected_features is not None
-                and expected_features != input_df.shape[1]
-            ):
-                raise ValueError(
-                    f"Model mengharapkan {expected_features} fitur, "
-                    f"tetapi aplikasi mengirim {input_df.shape[1]}. "
-                    "Periksa urutan dan jumlah fitur saat training."
-                )
-
-            prediction = model.predict(input_df)[0]
+            predicted_class = prediction[0]
 
             try:
-                predicted_id = int(prediction)
+                class_id = int(predicted_class)
             except (TypeError, ValueError):
-                predicted_id = prediction
+                class_id = None
 
-            predicted_name = CLASS_NAMES.get(
-                predicted_id,
-                str(predicted_id),
-            )
-
-            st.success("Prediksi berhasil dilakukan.")
-            st.markdown("### Hasil prediksi")
-
-            st.metric("Kelas prediksi", predicted_name)
-            st.write(f"ID kelas: `{predicted_id}`")
+            if class_id in CLASS_NAMES:
+                st.success(
+                    f"Hasil prediksi: **{CLASS_NAMES[class_id]}**"
+                )
+                st.write(f"ID kelas: {class_id}")
+            else:
+                st.success(f"Hasil prediksi: {predicted_class}")
 
             if hasattr(model, "predict_proba"):
-                probabilities = model.predict_proba(input_df)[0]
-                classes = getattr(model, "classes_", range(len(probabilities)))
+                probabilities = model.predict_proba(input_data)[0]
+                classes = getattr(
+                    model,
+                    "classes_",
+                    range(len(probabilities)),
+                )
 
-                probability_data = []
-
-                for class_id, probability in zip(classes, probabilities):
+                probability_rows = []
+                for class_value, probability in zip(
+                    classes, probabilities
+                ):
                     try:
-                        key = int(class_id)
+                        class_key = int(class_value)
+                        class_label = CLASS_NAMES.get(
+                            class_key, str(class_value)
+                        )
                     except (TypeError, ValueError):
-                        key = class_id
+                        class_label = str(class_value)
 
-                    probability_data.append({
-                        "Kelas": CLASS_NAMES.get(key, str(key)),
+                    probability_rows.append({
+                        "Kelas": class_label,
                         "Probabilitas": float(probability),
                     })
 
-                probability_df = pd.DataFrame(probability_data)
+                probability_df = pd.DataFrame(probability_rows)
                 probability_df = probability_df.sort_values(
                     "Probabilitas",
                     ascending=False,
                 )
 
-                st.markdown("### Probabilitas per kelas")
+                st.markdown("### Probabilitas Kelas")
                 st.dataframe(
-                    probability_df.style.format({
-                        "Probabilitas": "{:.2%}"
-                    }),
+                    probability_df,
                     use_container_width=True,
+                    hide_index=True,
                 )
 
-                chart_data = probability_df.set_index("Kelas")
-                st.bar_chart(chart_data)
-
-            with st.expander("Lihat fitur yang dikirim ke model"):
-                st.dataframe(input_df, use_container_width=True)
-
-        except Exception as exc:
-            st.error("Model gagal dimuat atau gagal melakukan prediksi.")
-            st.exception(exc)
-
-            st.markdown(
-                """
-                Periksa hal berikut:
-
-                - File model benar-benar tersimpan dan tidak rusak.
-                - Model berasal dari proses training yang benar.
-                - Versi Python dan pustaka sesuai dengan lingkungan training.
-                - Jumlah, urutan, skala, dan preprocessing fitur sama seperti saat training.
-                - Jika error `STACK_GLOBAL requires str` muncul saat memuat
-                  file `.pkl`, simpan ulang model dari lingkungan training
-                  menggunakan format yang benar.
-                """
+        except Exception as error:
+            st.error(f"Prediksi gagal: {error}")
+            st.info(
+                "Periksa HF_TOKEN di Streamlit Secrets, nama file model "
+                "di Hugging Face, serta kesesuaian urutan fitur dan "
+                "preprocessing dengan proses pelatihan."
             )
 
 
-# =========================================================
+# =====================================================
 # HALAMAN INFORMASI
-# =========================================================
-
+# =====================================================
 elif page == "Informasi":
     st.subheader("Informasi Proyek")
 
-    st.markdown(
-        """
-        ### Kelas tutupan lahan
+    st.markdown("### Fitur Model")
+    st.write(", ".join(FEATURES))
 
-        | ID | Kelas |
-        |---:|---|
-        | 1 | Sawah |
-        | 2 | Bangunan |
-        | 3 | Mangrove |
-        | 4 | Lahan Hijau |
-        | 5 | Laut |
-        | 6 | Danau/Ranu |
-
-        ### Fitur model
-
-        - Band Sentinel-2: B02, B03, B04, B08, B11
-        - Indeks spektral: NDVI, NDWI, MNDWI, NDBI
-
-        ### Catatan
-
-        Hasil prediksi pada halaman ini merupakan prediksi untuk satu
-        baris input fitur. Ini bukan klasifikasi raster penuh.
-
-        Cakupan peta bergantung pada ketersediaan raster dan area yang
-        memiliki data valid. Area tanpa data tidak boleh dianggap sebagai
-        kelas tutupan lahan.
-        """
+    st.markdown("### Kode Kelas")
+    class_df = pd.DataFrame([
+        {"ID Kelas": class_id, "Nama Kelas": class_name}
+        for class_id, class_name in CLASS_NAMES.items()
+    ])
+    st.dataframe(
+        class_df,
+        use_container_width=True,
+        hide_index=True,
     )
 
-st.sidebar.divider()
-st.sidebar.caption("Dashboard berbasis Streamlit")
+    st.markdown("### Rumus Indeks Spektral")
+    st.latex(r"NDVI = \frac{B08-B04}{B08+B04}")
+    st.latex(r"NDWI = \frac{B03-B08}{B03+B08}")
+    st.latex(r"MNDWI = \frac{B03-B11}{B03+B11}")
+    st.latex(r"NDBI = \frac{B11-B08}{B11+B08}")
+
+    st.warning(
+        "Rumus, skala band, urutan fitur, dan preprocessing harus sama "
+        "dengan yang digunakan saat model dilatih."
+    )
+
+st.divider()
+st.caption("Dashboard Klasifikasi Tutupan Lahan Jawa Timur")
